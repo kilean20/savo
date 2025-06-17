@@ -5,3 +5,4 @@ __version__ = "0.0.1"
 
 
 from .savo import *
+from . import optim

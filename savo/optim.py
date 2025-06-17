@@ -1,6 +1,6 @@
 import numpy as np
 
-class Adam:
+class adam:
     def __init__(self,
 #         betas=(0.9, 0.999), 
         betas=(0.8, 0.999), 
@@ -18,3 +18,8 @@ class Adam:
         self.v = self.betas[1]*self.v + (1.-self.betas[1])*grad*grad
         return self.m/((1.-self.betas[0]**self.t)*
                (np.sqrt(self.v/(1.-self.betas[1]**self.t))+self.eps))
+    
+    def reset(self):
+        self.m = 0
+        self.v = 0
+        self.t = 0
