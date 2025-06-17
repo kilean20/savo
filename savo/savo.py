@@ -13,12 +13,13 @@ import sys
 
 
 import os
-script_dir = os.path.dirname(os.path.realpath(__file__))
-sys.path.append(os.path.join(script_dir,'../../', 'machineIO'))
-from machineIO.construct_machineIO import Evaluator
-from machineIO.utils import df_mean_var, df_mean
+# script_dir = os.path.dirname(os.path.realpath(__file__))
+# sys.path.append(os.path.join(script_dir,'../../', 'machineIO'))
+# from machineIO.construct_machineIO import Evaluator
+# from machineIO.utils import df_mean_var, df_mean
 
 from .model import GaussianProcess
+from .util import df_mean_var
 
 
 class savo:
@@ -32,7 +33,8 @@ class savo:
                  objective_names: List[str],
                  composite_objective_name: str,
                  
-                 evaluator: Evaluator,
+                #  evaluator: Evaluator,
+                evaluator: Callable,
                  obj_func: Optional[Callable] = None,
                  obj_func_grad: Optional[Callable] = None,
                  obj_func_noise: Optional[float] = None,

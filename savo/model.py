@@ -371,6 +371,7 @@ class GaussianProcess(Model):
             )
 
             mll = ExactMarginalLogLikelihood(self.model.likelihood, self.model)
+            # TODO: improve HOGP training speed: limit epochs, adjust lr, etc
             with _fast_solves(True):
                 fit_gpytorch_mll_torch(
                     mll, step_limit=1000, optimizer=partial(Adam, lr=0.01)
