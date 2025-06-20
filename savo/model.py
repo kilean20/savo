@@ -396,48 +396,46 @@ class GaussianProcess(Model):
         xn = self.normalize_x(x)   
         pred = self.model(xn)
         y = self.unstandardize_y(pred.mean)
-        yvar = self.unstandardize_yvar(pred.var)
+        yvar = self.unstandardize_yvar(pred.variance)
         return y, yvar
     
 
     def get_grad(self, 
                 x: torch.Tensor, 
                 #  prior_mean_model_grad: Optional[Callable] = None
-                n_samples: int = 32,
+                n_samples: int = 1,
                 ) -> torch.Tensor:
         """
         Calculate gradients of the model predictions with respect to input data.
         """
         batch_size = x.shape[0]
         x_ = x.clone().requires_grad_(True)  # x is shape of (batch_size, self.n_input_dim)
-        # y, yvar = self(x_)
-        # if self.objective is not None:
-        #     y = self.objective(y)  # TODO verify shape of output from GenericMCObjective
-        # y = y.sum()
-        # y.backward()
-        # dydx = x_.grad
+        if n_samples == 1:
+            y, yvar = self(x_)
+            if self.objective is not None:
+                y = self.objective(y)  # TODO verify shape of output from GenericMCObjective
+            y = y.sum()
+            y.backward()
+            dydx = x_.grad
 
-        # if not return_grad_var:
-        #     return dydx
-        # else:
-            # x_ = x.clone().requires_grad_(True)
-        xn = self.normalize_x(x_)
-        posterior = self.model.posterior(xn)
-        samples = posterior.rsample(torch.Size([n_samples]))  #(n_samples, batch_size, self.n_output_dim) 
-        # print(f"Shape of samples: {samples.shape}")
-        samples = self.unstandardize_y(samples) #(n_samples*batch_size, self.n_output_dim)
-        # print(f"Shape of samples after unstandardize: {samples.shape}")
-        if self.objective is not None:
-            samples = self.objective(samples).view(n_samples, -1, 1) #(n_samples, batch_size, 1) 
-            # print(f"Shape of samples after objective: {samples.shape}")
+        else:
+            xn = self.normalize_x(x_)
+            posterior = self.model.posterior(xn)
+            samples = posterior.rsample(torch.Size([n_samples]))  #(n_samples, batch_size, self.n_output_dim) 
+            # print(f"Shape of samples: {samples.shape}")
+            samples = self.unstandardize_y(samples) #(n_samples*batch_size, self.n_output_dim)
+            # print(f"Shape of samples after unstandardize: {samples.shape}")
+            if self.objective is not None:
+                samples = self.objective(samples).view(n_samples, -1, 1) #(n_samples, batch_size, 1) 
+                # print(f"Shape of samples after objective: {samples.shape}")
 
-        dydx = torch.autograd.grad(
-            outputs=samples,
-            inputs=x_,
-            grad_outputs=torch.ones_like(samples),
-            retain_graph=False,
-            create_graph=False,
-        )[0]
+            dydx = torch.autograd.grad(
+                outputs=samples,
+                inputs=x_,
+                grad_outputs=torch.ones_like(samples),
+                retain_graph=False,
+                create_graph=False,
+            )[0]/n_samples
         # print("dydx.shape",dydx.shape)
         # print(f"Shape of grads: {dydx.shape}") # (batch_size, self.n_input_dim) 
             # torch.autograd.grad returns a tuple of gradients.  
