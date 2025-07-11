@@ -284,8 +284,8 @@ class savo:
             lrES = self.lrES
             
         if lr_adapt2obj_params is not None:
-            lrES = lrES/(1+lr_adapt2obj_params[0]*np.exp(self.y- lr_adapt2obj_params[1]))
-            lr = lr    /(1+lr_adapt2obj_params[0]*np.exp(self.y- lr_adapt2obj_params[1]))
+            lrES = lrES/(1+np.exp(lr_adapt2obj_params[0]*(self.y- lr_adapt2obj_params[1])))
+            lr = lr    /(1+np.exp(lr_adapt2obj_params[0]*(self.y- lr_adapt2obj_params[1])))
                 
         if self.future is None:
             dxES = self._get_ES_setp()
