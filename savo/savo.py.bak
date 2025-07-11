@@ -200,7 +200,7 @@ class savo:
 
         self.model = GaussianProcess(train_x,train_y,train_yvar,self.obj_func,obj_func_noise=self.obj_func_noise, train_epochs=model_train_budget)
         self.history['model_fitloss_histroy'].append(self.model.loss_history.losses)
-        self.history['model_fit_time'].append(self.model.loss_history.runtime)
+		self.history['model_fit_time'].append(self.model.loss_history.runtime)
 
 
     def _adaptive_kES(self, update_rate=0.01, grad=None):
@@ -275,7 +275,7 @@ class savo:
              optimizer: Optional[Callable] = None,
              penalize_uncertain_gradient: bool = False,
              normalize_gradient_step: bool = False,
-             lr_adapt2obj_params: Optional[List[float]] = [1,0],
+             lr_adapt2obj_params: Optional[List[float]]: [1,0],
             ):
         
         if lr is None:
@@ -284,8 +284,8 @@ class savo:
             lrES = self.lrES
             
         if lr_adapt2obj_params is not None:
-            lrES = lrES/(1+lr_adapt2obj_params[0]*np.exp(self.y- lr_adapt2obj_params[1]))
-            lr = lr    /(1+lr_adapt2obj_params[0]*np.exp(self.y- lr_adapt2obj_params[1]))
+        lrES = lrES/(1+lr_adapt2obj_params[0]*np.exp(self.y- lr_adapt2obj_params[1]))
+        lr = lr/(1+np.exp(self.y))
                 
         if self.future is None:
             dxES = self._get_ES_setp()

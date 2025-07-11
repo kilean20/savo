@@ -144,16 +144,13 @@ def df_mean_var(df):
     mean.name = df.index[0]
     var = df.var()
     var.name = df.index[0]
-    with torch.no_grad():
-        for col in df.columns:
-            if 'obj' not in col:
-                if 'PHASE' in col:
-                    if 'BPM' in col:
-                        m,v = cyclic_mean_var(df[col], -90, 90)
-                        mean[col], var[col]= m.item(), v.item()
-                    else:
-                        m,v = cyclic_mean_var(df[col], -180, 180)
-                        mean[col], var[col]= m.item(), v.item()
+    for col in df.columns:
+        if 'obj' not in col:
+            if 'PHASE' in col:
+                if 'BPM' in col:
+                    mean[col], var[col]= cyclic_mean_var(df[col], -90, 90)
+                else:
+                    mean[col], var[col]= cyclic_mean_var(df[col], -180, 180)
     return mean, var
 
             

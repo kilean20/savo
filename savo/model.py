@@ -1,37 +1,35 @@
 from abc import ABC, abstractmethod
 from typing import Callable, Optional, Any, Tuple, Dict
-from collections import OrderedDict
 from functools import partial
 import io
 import contextlib
 import warnings
 import re
+import matplotlib.pyplot as plt
 
 import numpy as np
 import torch
 from torch.optim import Adam
-import matplotlib.pyplot as plt
+from torch.distributions import Normal
 
 import gpytorch
+from gpytorch.lazy import LazyTensor
 from gpytorch.mlls import ExactMarginalLogLikelihood
-# from gpytorch.likelihoods import GaussianLikelihood
-# from gpytorch.likelihoods import FixedNoiseGaussianLikelihood
 
+import botorch
 from botorch.models import SingleTaskGP, HigherOrderGP
-from botorch.models.fully_bayesian import SaasFullyBayesianSingleTaskGP
-from botorch import fit_fully_bayesian_model_nuts
+from botorch.models.transforms.input import Normalize
+from botorch.models.transforms.outcome import Standardize
+from botorch.models.higher_order_gp import FlattenedStandardize
 from botorch.fit import fit_gpytorch_mll, fit_gpytorch_mll_torch
 from botorch.acquisition.objective import GenericMCObjective
+from botorch.optim.core import OptimizationResult 
 
 from linear_operator.settings import _fast_solves
 
+
 escaped_message = re.escape("added jitter of")
 warnings.filterwarnings("ignore", message=f".*{escaped_message}.*")
-
-
-
-# TODO: train multiple models of different kernels (including RBFWithLinearTransformationKernel) in parallel and get best model in terms of data likelihood
-
 
 
 def remove_near_duplicates(train_x, train_y, train_yvar=None, tol=1e-9):
@@ -59,6 +57,28 @@ def remove_near_duplicates(train_x, train_y, train_yvar=None, tol=1e-9):
 
     return train_x, train_y, train_yvar
 
+class LossCollectorCallback:
+    """
+    A simple callback class to collect and store the loss at each
+    optimization step.
+    """
+    def __init__(self):
+        self.losses = []
+        self.steps = []
+
+    def __call__(self, parameters: Dict[str, torch.Tensor], result: OptimizationResult) -> None:
+        self.steps.append(result.step)
+        self.losses.append(result.fval)
+        self.runtime = result.runtime
+        self.message = result.message
+
+    def get_and_clear(self):
+        """Returns the collected data and clears the internal lists."""
+        data = (self.steps, self.losses)
+        self.steps = []
+        self.losses = []
+        return data, self.runtime, self.message
+
 
 class Model(ABC):
     def __init__(self,
@@ -67,142 +87,10 @@ class Model(ABC):
                 ):
         """
         Abstract base class for models.
-
-        Parameters
-        ----------
-        x : torch.Tensor
-            Training input data.
-        y : torch.Tensor
-            Corresponding target values.
         """
         assert x.dim() == y.dim() == 2
-        self.n_input_dim = x.shape[1]#if x.ndim > 1 else 1
-        self.n_output_dim = y.shape[1]# if y.ndim > 1 else 1
-        # print("y.shape",y.shape)
-        # self.x = x.view(-1, self.n_input_dim)
-        # self.y = y.view(-1, self.n_output_dim)
-        self._set_standardization_params(x, y)
-
-
-    def _set_standardization_params(self, x: torch.Tensor, y: torch.Tensor) -> None:
-        """
-        Set standardization parameters for input and output data.
-
-        Parameters
-        ----------
-        x : torch.Tensor
-            Input data.
-        y : torch.Tensor
-            Output data.
-        """
-        self.x_min = x.min(dim=0).values.reshape(1, -1)
-        self.x_diff = x.max(dim=0).values.reshape(1, -1) - self.x_min   + 1e-6
-
-        self.y_mean = y.mean(dim=0).reshape(1, -1)
-        self.y_std = y.std(dim=0).reshape(1, -1) + 1e-6
-
-        if torch.any(self.x_diff == 0):
-            raise ValueError("Input data has zero range in one or more dimensions.")
-        if torch.any(self.y_std == 0):
-            raise ValueError("Output data has zero standard deviation in one or more dimensions.")
-        
-
-    def normalize_x(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Normalize input data.
-
-        Parameters
-        ----------
-        x : torch.Tensor
-            Input data.
-
-        Returns
-        -------
-        torch.Tensor
-            Normalized input data.
-        """
-        return (x - self.x_min) / self.x_diff
-    
-    def unnormalize_x(self, xn: torch.Tensor) -> torch.Tensor:
-        """
-        Unnormalize input data.
-
-        Parameters
-        ----------
-        xn : torch.Tensor
-            Normalized input data.
-
-        Returns
-        -------
-        torch.Tensor
-            Unnormalized input data.
-        """
-        return xn * self.x_diff + self.x_min
-
-    def standardize_y(self, y: torch.Tensor) -> torch.Tensor:
-        """
-        Standarize output data.
-
-        Parameters
-        ----------
-        y : torch.Tensor
-            Output data.
-
-        Returns
-        -------
-        torch.Tensor
-            Standarized output data.
-        """
-        return (y - self.y_mean) / self.y_std
-
-    def unstandardize_y(self, yn: torch.Tensor) -> torch.Tensor:
-        """
-        UnStandarize output data.
-
-        Parameters
-        ----------
-        yn : torch.Tensor
-            Standarized output data.
-
-        Returns
-        -------
-        torch.Tensor
-            UnStandarized output data.
-        """
-        return yn * self.y_std + self.y_mean
-    
-    def standardize_yvar(self, yvar: torch.Tensor) -> torch.Tensor:
-        """
-        Standardize output variance.
-
-        Parameters
-        ----------
-        yvar : torch.Tensor
-            Output variance.
-
-        Returns
-        -------
-        torch.Tensor
-            Standardized output variance.
-        """
-        return yvar / (self.y_std ** 2)
-    
-    def unstandardize_yvar(self, yvar: torch.Tensor) -> torch.Tensor:
-        """
-        Unstandardize output variance.
-
-        Parameters
-        ----------
-        yvar : torch.Tensor
-            Standardized output variance.
-
-        Returns
-        -------
-        torch.Tensor
-            Unstandardized output variance.
-        """
-        return yvar * (self.y_std ** 2) 
-
+        self.n_input_dim = x.shape[1]
+        self.n_output_dim = y.shape[1]
 
     @abstractmethod
     def fit(
@@ -213,221 +101,142 @@ class Model(ABC):
     ) -> None:
         """
         Fit the model to training data.
-
-        Parameters
-        ----------
-        x : torch.Tensor
-            Training input data.
-        y : torch.Tensor
-            Corresponding target values.
         """
         pass
 
     @abstractmethod
-    def __call__(self, 
+    def __call__(self,
                 x: torch.Tensor,
-                ) -> Dict[ str, torch.Tensor]:
+                ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Make predictions using the model.
-
-        Parameters
-        ----------
-        x : torch.Tensor
-            Input data for which predictions are made.
-        return_var : bool, optional
-            Whether to return prediction variances, by default True.
-        return_grad : bool, optional
-            Whether to return gradients of predictions, by default False.
-        return_grad_var : bool, optional
-            Whether to return variances of gradients, by default False.
-
-        Returns
-        -------
-        Dict[ str, torch.Tensor]
         """
         pass
 
 
 class GaussianProcess(Model):
-    def __init__(self, 
+    def __init__(self,
                 x: torch.Tensor,
                 y: torch.Tensor,
                 yvar: Optional[torch.Tensor] = None,
                 objective: Optional[Callable] = None,
                 obj_func_noise: Optional[float] = None,
+                train_epochs: Optional[int] = 200,
                 ):
         """
         Gaussian Process regression model.
-
-        Parameters
-        ----------
-        x : torch.Tensor
-            Training input data.
-        y : torch.Tensor
-            Corresponding target values.
         """
         super().__init__(x,y)
         self.obj_func_noise = obj_func_noise
-        self.fit(x,y,yvar)
+        self.train_epochs = train_epochs
+        self.fit(x,y,yvar,train_epochs=train_epochs)
         if self.n_output_dim > 1:
             assert objective is not None, "Objective function must be provided for multi-output Gaussian Process."
-            # def objective_wrapper(x):
-                
-            #     orig_shape = x.shape
-            #     if x.dim() == 2:
-            #         batch_size, n_output_dim =  x.shape
-            #         n_sample = 1
-            #         q = 1
-            #     elif x.dim() == 3:
-            #         batch_size, q, n_output_dim = x.shape
-            #         n_sample = 1
-            #     elif x.dim() == 4:
-            #         n_sample, batch_size, q, n_output_dim = x.shape
-            #     else:
-            #         raise ValueError(f"Unsupported input shape {x.shape} for objective function.")
-            #     x = x.view(-1, n_output_dim)
-            #     composite_obj = objective(x)  # objective should take input of shape (batch_size, n_output_dim) or (n_sample, batch_size, n_output_dim)
-            #     return composite_obj.view(n_sample,batch_size,q)
-                    
-            # self.MCObjective = GenericMCObjective(objective_wrapper) # TODO: test GenericMCObjective 
+        self.objective = objective
 
-            self.objective = objective
-        else:
-            # self.MCObjective = None
-            self.objective = None
-
-    def fit(self, 
-            x: torch.Tensor, 
-            y: torch.Tensor, 
+    def fit(self,
+            x: torch.Tensor,
+            y: torch.Tensor,
             yvar: Optional[torch.Tensor] = None,
+            train_epochs: Optional[int] = None,
             ) -> None:
         """
         Fit a Gaussian Process regressor to the training data.
-
-        Parameters
-        ----------
-        x : torch.Tensor
-            Training input data.
-        y : torch.Tensor
-            Corresponding target values.
         """
-        self.x = x.view(-1, self.n_input_dim)
-        self.y = y.view(-1, self.n_output_dim)
-        self._set_standardization_params(x, y)
-
-        xn = self.normalize_x(self.x)
-        yn = self.standardize_y(self.y)
+        x = x.view(-1, self.n_input_dim)
+        y = y.view(-1, self.n_output_dim)
         if yvar is not None:
-            if yvar.shape != self.y.shape:
-                raise ValueError("yvar must have the same shape as y")
             yvar = yvar.view(-1, self.n_output_dim)
-            yvarn = self.standardize_yvar(yvar) 
-        else:
-            yvarn = None
 
-        xn,yn,yvarn = remove_near_duplicates(xn,yn,yvarn)
+        x, y, yvar = remove_near_duplicates(x, y, yvar)
+        self.train_x = x
+        self.train_y = y
+        self.train_yvar = yvar
 
-        if self.obj_func_noise is not None:
-            yvar = torch.full_like(yn, self.obj_func_noise)
-            yvarn = self.standardize_yvar(yvar) 
+        if self.obj_func_noise is not None and yvar is None:
+            yvar = torch.full_like(y, self.obj_func_noise)
 
+        if train_epochs is None:
+            train_epochs = self.train_epochs
+
+        loss_collector = LossCollectorCallback()
         if self.n_output_dim == 1:
-            # covar_module = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=self.n_input_dim))
+            covar_module = gpytorch.kernels.ScaleKernel(
+                gpytorch.kernels.RBFKernel(ard_num_dims=self.n_input_dim)
+            )
             self.model = SingleTaskGP(
-                    train_X=xn,
-                    train_Y=yn,
-                    train_Yvar=yvarn,
-                    # likelihood=GaussianLikelihood(),
-                    # covar_module=covar_module,
+                    train_X=x,
+                    train_Y=y,
+                    train_Yvar=yvar,
+                    covar_module=covar_module,
+                    input_transform=Normalize(d=x.shape[-1]),
+                    outcome_transform=Standardize(m=y.shape[-1])
                     )
 
             mll = ExactMarginalLogLikelihood(self.model.likelihood, self.model)
-            fit_gpytorch_mll(mll)
-
-            # TODO: add option for SaasFullyBayesianSingleTaskGP when input dimension is too high. 
-            # SaasFullyBayesianSingleTaskGP training is too slow... simplify training using gradient decsent instead of NUTS
-            # self.model = SaasFullyBayesianSingleTaskGP(
-            #         train_X=xn,
-            #         train_Y=yn,
-            #         train_Yvar=yvarn,
-            #         # likelihood=GaussianLikelihood(),
-            #         # covar_module=covar_module,
-            #         )
-            # fit_fully_bayesian_model_nuts(
-            #                             self.model,
-            #                             warmup_steps=32,
-            #                             num_samples=16,
-            #                             thinning=16,
-            #                             disable_progbar=True)
-
+            # fit_gpytorch_mll(mll)
             
-        else:
-            # Higher-order GP for multi-output
-            self.model = HigherOrderGP(
-                train_X=xn,
-                train_Y=yn,
-                # train_Yvar=yvarn,
-                latent_init='gp',
-            )
-
-            mll = ExactMarginalLogLikelihood(self.model.likelihood, self.model)
-            # TODO: improve HOGP training speed: limit epochs, adjust lr, etc
             with _fast_solves(True):
                 fit_gpytorch_mll_torch(
-                    mll, step_limit=1000, optimizer=partial(Adam, lr=0.01)
+                    mll, step_limit=train_epochs, optimizer=partial(Adam, lr=0.2), callback=loss_collector,
                 )
-            # TODO: add option for SaasFullyBayesianMultiTaskGP
 
-    def __call__(self, 
+        else:
+            self.model = HigherOrderGP(
+                train_X=x,
+                train_Y=y,
+                latent_init='gp',
+                input_transform=Normalize(d=x.shape[-1]),
+                outcome_transform=FlattenedStandardize(y.shape[1:]),
+            )
+            mll = ExactMarginalLogLikelihood(self.model.likelihood, self.model)
+            with _fast_solves(True):
+                fit_gpytorch_mll_torch(
+                    mll, step_limit=train_epochs, optimizer=partial(Adam, lr=0.2), callback=loss_collector,
+                )
+        self.loss_history = loss_collector
+        # print(f"Model training completed in {self.loss_history.runtime:.2f} seconds. Message: {self.loss_history.message}")
+        # fig, ax = plt.subplots(figsize=(4, 2))
+        # ax.plot(self.loss_history.losses)
+        # ax.set_title("Loss Curve During Model Fitting")
+        # ax.set_xlabel("Iteration")
+        # ax.set_ylabel("Loss (Negative Marginal Log Likelihood)")
+        # ax.grid(True)
+        # plt.show()
+        # plt.close(fig)
+
+
+    def __call__(self,
                 x: torch.Tensor,
                 n_sample = 16,
-                ) -> Dict[ str, torch.Tensor]:
+                ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Make predictions using the model.
-
-        Parameters
-        ----------
-        x : torch.Tensor
-            Input data for which predictions are made.
-        Returns
-        -------
-        Dict[ str, torch.Tensor]
         """
-        xn = self.normalize_x(x)   
-        pred = self.model(xn)
-        y = self.unstandardize_y(pred.mean)
-        yvar = self.unstandardize_yvar(pred.variance)
-        return y, yvar
-    
+        posterior = self.model.posterior(x)
+        return posterior.mean, posterior.variance
 
-    def get_grad(self, 
-                x: torch.Tensor, 
-                #  prior_mean_model_grad: Optional[Callable] = None
+
+    def get_grad(self,
+                x: torch.Tensor,
                 n_samples: int = 1,
                 ) -> torch.Tensor:
         """
         Calculate gradients of the model predictions with respect to input data.
         """
-        batch_size = x.shape[0]
-        x_ = x.clone().requires_grad_(True)  # x is shape of (batch_size, self.n_input_dim)
+        x_ = x.clone().requires_grad_(True)
         if n_samples == 1:
-            y, yvar = self(x_)
+            y, _ = self(x_)
             if self.objective is not None:
-                y = self.objective(y)  # TODO verify shape of output from GenericMCObjective
+                y = self.objective(y)
             y = y.sum()
             y.backward()
             dydx = x_.grad
-
         else:
-            xn = self.normalize_x(x_)
-            posterior = self.model.posterior(xn)
-            samples = posterior.rsample(torch.Size([n_samples]))  #(n_samples, batch_size, self.n_output_dim) 
-            # print(f"Shape of samples: {samples.shape}")
-            samples = self.unstandardize_y(samples) #(n_samples*batch_size, self.n_output_dim)
-            # print(f"Shape of samples after unstandardize: {samples.shape}")
+            posterior = self.model.posterior(x_)
+            samples = posterior.rsample(torch.Size([n_samples]))
             if self.objective is not None:
-                samples = self.objective(samples).view(n_samples, -1, 1) #(n_samples, batch_size, 1) 
-                # print(f"Shape of samples after objective: {samples.shape}")
+                samples = self.objective(samples).view(n_samples, -1, 1)
 
             dydx = torch.autograd.grad(
                 outputs=samples,
@@ -436,9 +245,158 @@ class GaussianProcess(Model):
                 retain_graph=False,
                 create_graph=False,
             )[0]/n_samples
-        # print("dydx.shape",dydx.shape)
-        # print(f"Shape of grads: {dydx.shape}") # (batch_size, self.n_input_dim) 
-            # torch.autograd.grad returns a tuple of gradients.  
-            # Each element corresponds to one tensor in the inputs argument. 
-            # For a single input tensor, use grads[0] to get the gradient.
-        return dydx # (batch_size, self.n_input_dim)  # averging over samples effectively reduce magnitude of the gradient from variation of gradients
+        return dydx
+
+    def _get_KXX_inv(self):
+        """
+        Get the inverse of the noisy kernel matrix, (K_XX + sigma^2*I)^-1.
+        """
+        L_inv_upper = self.model.prediction_strategy.covar_cache.detach()
+        return L_inv_upper @ L_inv_upper.transpose(-1, -2)
+
+    def _get_KxX_dx(self, xn: torch.Tensor) -> torch.Tensor:
+        """
+        Computes the derivative of the kernel K(x,X) w.r.t. x.
+        Uses an efficient analytic formula for RBF kernels, and falls back
+        to autograd for other kernel types. Operates on normalized data.
+        """
+        covar_module = self.model.covar_module
+        is_rbf = (
+            hasattr(covar_module, "base_kernel") and
+            isinstance(covar_module.base_kernel, gpytorch.kernels.RBFKernel)
+        )
+
+        if is_rbf:
+            if xn.dim() == 2:
+                xn = xn.unsqueeze(0)
+            Xn = self.model.train_inputs[0]
+            lengthscale = covar_module.base_kernel.lengthscale.detach()
+            K_xX = covar_module(xn, Xn).to_dense()
+            diff = xn.unsqueeze(-2) - Xn.unsqueeze(-3)
+            derivative_term = diff * K_xX.unsqueeze(-1)
+            K_xX_dx = (-1 / lengthscale ** 2) * derivative_term
+            return K_xX_dx.squeeze(0).permute(0, 2, 1)
+        else:
+            # ROBUST FALLBACK: Abandon vmap and loop over the batch dimension.
+            from torch.func import jacrev
+            if xn.dim() != 2:
+                raise ValueError(f"Expected xn to be a 2D tensor, but got shape {xn.shape}")
+            
+            Xn = self.model.train_inputs[0]
+            
+            def single_x_kernel_fn(x_i):
+                return covar_module(x_i.unsqueeze(0), Xn).to_dense().squeeze(0)
+
+            jacobians = [jacrev(single_x_kernel_fn)(x_i) for x_i in xn]
+            
+            k_xX_dx_jac = torch.stack(jacobians, dim=0) 
+
+            return k_xX_dx_jac.permute(0, 2, 1)
+
+
+    def _get_Kxx_dx2(self) -> torch.Tensor:
+        """
+        Computes the second derivative (Hessian) of the kernel K(x,x')
+        w.r.t. x and x', evaluated at x=x'.
+        Uses an efficient analytic formula for RBF kernels, and falls back
+        to autograd for other stationary kernel types.
+        """
+        covar_module = self.model.covar_module
+        is_rbf = (
+            hasattr(covar_module, "base_kernel") and
+            isinstance(covar_module.base_kernel, gpytorch.kernels.RBFKernel)
+        )
+
+        if is_rbf:
+            lengthscale = covar_module.base_kernel.lengthscale.detach()
+            outputscale = covar_module.outputscale.detach()
+            hessian = (torch.eye(self.n_input_dim, device=lengthscale.device) / lengthscale ** 2) * outputscale
+            return hessian
+        else:
+            from torch.func import jacrev
+            
+            n_dims = self.n_input_dim
+            device = self.train_x.device
+            x0 = torch.zeros(1, n_dims, device=device)
+            
+            # FINAL FIX: Explicitly convert to a dense tensor before squeezing.
+            grad_k_wrt_xp_fn = jacrev(
+                lambda x, xp: covar_module(x, xp).to_dense().squeeze(),
+                argnums=1
+            )
+            hessian_fn = jacrev(grad_k_wrt_xp_fn, argnums=0)
+            hessian = hessian_fn(x0, x0)
+            return hessian.squeeze()
+
+    def get_gradient_posterior(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Computes the posterior mean and covariance of the GP's gradient.
+        """
+        if self.n_output_dim > 1:
+            raise NotImplementedError("get_gradient_posterior is only implemented for single-output GPs.")
+
+        self.model.eval()
+        input_transform = self.model.input_transform
+        x_scale = input_transform.ranges
+        outcome_transform = self.model.outcome_transform
+        y_std = outcome_transform.stdvs
+
+        xn = self.model.input_transform(x)
+        with torch.no_grad():
+            self.model.posterior(self.model.train_inputs[0])
+
+        K_inv = self._get_KXX_inv()
+        K_xX_dx = self._get_KxX_dx(xn)
+        Kxx_dx2 = self._get_Kxx_dx2()
+        train_yn_col = self.model.train_targets.view(-1, 1)
+
+        alpha = K_inv @ train_yn_col
+        mu_grad_normalized = (K_xX_dx @ alpha).squeeze(-1)
+        cov_term = torch.bmm(K_xX_dx @ K_inv, K_xX_dx.transpose(-1, -2))
+        Sigma_grad_normalized = Kxx_dx2 - cov_term
+        Sigma_grad_normalized = Sigma_grad_normalized.clamp_min(1e-9)
+
+        scaling_factor = y_std / x_scale
+        mu_grad = mu_grad_normalized * scaling_factor
+        scaling_outer = scaling_factor.t() @ scaling_factor
+        Sigma_grad = Sigma_grad_normalized * scaling_outer
+
+        return mu_grad.detach(), Sigma_grad.detach()
+
+
+    def get_maximum_probable_gradient(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Get the Most Probable Ascent direction vector.
+        """
+        mu_grad, Sigma_grad = self.get_gradient_posterior(x)
+
+        assert Sigma_grad.dim() == 3, "Sigma_grad must be a 3D tensor (n, d, d)"
+        assert mu_grad.dim() == 2, "mu_grad must be a 2D tensor (n, d)"
+        assert Sigma_grad.shape[0] == mu_grad.shape[0], "Batch dimensions of Sigma_grad and mu_grad must match"
+        assert Sigma_grad.shape[1] == Sigma_grad.shape[2], "Sigma_grad matrices must be square"
+        assert Sigma_grad.shape[1] == mu_grad.shape[1], "Dimensions of Sigma_grad and mu_grad must match"
+
+        n, d = mu_grad.shape
+
+        with torch.no_grad():
+            try:
+                jitter = 1e-9 * torch.eye(d, device=Sigma_grad.device, dtype=Sigma_grad.dtype)
+                L = torch.linalg.cholesky(Sigma_grad + jitter.unsqueeze(0))
+                mu_grad_reshaped = mu_grad.unsqueeze(-1)
+                v_raw = torch.cholesky_solve(mu_grad_reshaped, L).squeeze(-1)
+            except torch.linalg.LinAlgError:
+                warnings.warn("Cholesky decomposition failed. Falling back to linalg.solve().")
+                jitter = 1e-6 * torch.eye(d, device=Sigma_grad.device, dtype=Sigma_grad.dtype)
+                v_raw = torch.linalg.solve(Sigma_grad + jitter.unsqueeze(0), mu_grad)
+
+            v = torch.nn.functional.normalize(v_raw, p=2, dim=-1)
+            dot_product = torch.sum(mu_grad * v, dim=-1, keepdim=True)
+            mu_grad_projected_on_v = dot_product * v
+
+            # Calculate the argument for the CDF: sqrt(μ^T Σ⁻¹ μ) = sqrt(μ^T v_raw)
+            mu_dot_v_raw = torch.sum(mu_grad * v_raw, dim=-1)
+            cdf_arg = torch.sqrt(torch.clamp_min(mu_dot_v_raw, 0.0))
+            # Compute the probability using the standard normal CDF, Φ(cdf_arg)
+            probability = Normal(0, 1).cdf(cdf_arg)
+
+        return mu_grad_projected_on_v, probability
