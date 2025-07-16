@@ -45,14 +45,16 @@ class savo:
                  n_grad_ave: Optional[int] = None,
                  lr: Optional[float] = None,
                  lrES: Optional[float] = None,
-                 optimum_for_lr_reduction: Optional[float] = None,
                  optimizer: Optional[Callable] = None,
                  prev_history: Optional[Dict] = None,
                  
                  clip_gradient: Optional[bool] = True,
                  use_ctrRD_to_train: bool = True,
                  minimize: Optional[bool] = False,
-                 adapt_ES_gain: Optional[bool] = False,            
+                 adapt_ES_gain: Optional[bool] = False,
+                 asynchronous: Optional[bool] = False,
+
+                 **kwargs,
                  ):  
         self.now = datetime.now()
         self.control_CSETs = control_CSETs
@@ -100,6 +102,7 @@ class savo:
         self.clip_gradient = clip_gradient
         self.use_ctrRD_to_train = use_ctrRD_to_train
         self.adapt_ES_gain = adapt_ES_gain
+        self.asynchronous = asynchronous
     
         if prev_history is not None:
             self.history = copy(prev_history)
@@ -276,6 +279,7 @@ class savo:
              penalize_uncertain_gradient: bool = False,
              normalize_gradient_step: bool = False,
              lr_adapt2obj_params: Optional[List[float]] = [1,0],
+             asynchronous: Optional[bool] = None,
             ):
         
         if lr is None:
@@ -286,15 +290,19 @@ class savo:
         if lr_adapt2obj_params is not None:
             lrES = lrES/(1+np.exp(lr_adapt2obj_params[0]*(self.y- lr_adapt2obj_params[1])))
             lr = lr    /(1+np.exp(lr_adapt2obj_params[0]*(self.y- lr_adapt2obj_params[1])))
+
+        if asynchronous is None:
+            asynchronous = self.asynchronous
                 
         if self.future is None:
             dxES = self._get_ES_setp()
             self.x += dxES*lrES
             self.future = self.evaluator.submit(self.x)
 
-        self.process_evaluator_future()
-        dxES = self._get_ES_setp()
+        if not asynchronous:
+            self.process_evaluator_future()
 
+        dxES = self._get_ES_setp()
         if lr > 0:
             self.train_model()
             dxSG = self._get_SG_step(optimizer=optimizer,penalize_uncertain_gradient=penalize_uncertain_gradient)
@@ -308,6 +316,10 @@ class savo:
                 dxSG = np.clip(dxSG,a_min = -self.control_maxstep,a_max= self.control_maxstep)
         else:
             dxSG = 0
+
+        if asynchronous:
+            self.process_evaluator_future()
+
         self.x += dxSG*lr + dxES*lrES
         self.x = np.clip(self.x, a_min=self.control_min, a_max=self.control_max)
         self.future = self.evaluator.submit(self.x)
