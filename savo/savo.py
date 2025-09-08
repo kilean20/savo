@@ -48,7 +48,7 @@ class savo:
                  optimizer: Optional[Callable] = None,
                  prev_history: Optional[Dict] = None,
                  
-                 clip_gradient: Optional[bool] = True,
+                 clip_gradient: Optional[bool] = False,
                  use_ctrRD_to_train: bool = True,
                  minimize: Optional[bool] = False,
                  adapt_ES_gain: Optional[bool] = False,
@@ -120,7 +120,7 @@ class savo:
         else:
             self.aES = self.control_maxstep  
             # ES dithering freq = 2pi*nu/10,  nu in [0.5,1], factor 10 for at least 10 iteration for smoothing (with dt=1).
-            self.wES = self.wES = 2*np.pi * (0.5*(np.arange(self.ndim) +0.5) / self.ndim + 0.5)/ 10
+            self.wES = 2*np.pi * (0.5*(np.arange(self.ndim) +0.5) / self.ndim + 0.5)/ 10
             # ES gain, assuming change of objective in each iter is Delta(obj) ~ O(0.02) and kES*Delta(obj) ~ 0.1*wES*dt, so that phase change from gain is about 10% of dithering phase change.
             self.kES = 0.1*self.wES/0.02
             self.history = {
@@ -323,3 +323,9 @@ class savo:
         self.x += dxSG*lr + dxES*lrES
         self.x = np.clip(self.x, a_min=self.control_min, a_max=self.control_max)
         self.future = self.evaluator.submit(self.x)
+
+    def evaluate(self,x):
+        self.x = x
+        self.future = self.evaluator.submit(self.x)
+        self.process_evaluator_future()
+        return -self.y
