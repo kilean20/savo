@@ -2,8 +2,9 @@ import numpy as np
 
 class adam:
     def __init__(self,
-         betas=(0.9, 0.999), 
+        betas=(0.9, 0.999), 
 #        betas=(0.8, 0.999), 
+#        betas=(0.8, 0.9), 
         eps=1e-08, 
         ):    
         self.m = 0

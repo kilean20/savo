@@ -400,3 +400,65 @@ class GaussianProcess(Model):
             probability = Normal(0, 1).cdf(cdf_arg)
 
         return mu_grad_projected_on_v, probability
+    
+
+    def get_gradient_covariance_trace(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Compute the trace of the gradient covariance matrix.
+        """
+        _, Sigma_grad = self.get_gradient_posterior(x)
+        # Sigma_grad has shape (n, d, d)
+        trace = torch.diagonal(Sigma_grad, dim1=-2, dim2=-1).sum(dim=-1)
+        return trace
+
+    def get_probability_of_descent(self, x: torch.Tensor, direction: torch.Tensor) -> torch.Tensor:
+        """
+        Compute the probability of descent along a given direction vector.
+                
+        The probability is computed as Φ(-μ_∇f^T v / √(v^T Σ_∇f v)) where:
+        - μ_∇f is the gradient mean
+        - Σ_∇f is the gradient covariance  
+        - v is the given direction
+        - Φ is the standard normal CDF
+        """
+        if self.n_output_dim > 1:
+            raise NotImplementedError("get_probability_of_descent is only implemented for single-output GPs.")
+        
+        mu_grad, Sigma_grad = self.get_gradient_posterior(x)
+        n, d = mu_grad.shape
+        
+        # Handle direction tensor dimensions
+        if direction.dim() == 1:
+            if direction.shape[0] != d:
+                raise ValueError(f"Direction vector dimension {direction.shape[0]} doesn't match input dimension {d}")
+            # Broadcast to match batch size
+            direction = direction.unsqueeze(0).expand(n, -1)
+        elif direction.dim() == 2:
+            if direction.shape != (n, d):
+                raise ValueError(f"Direction tensor shape {direction.shape} doesn't match expected shape ({n}, {d})")
+        else:
+            raise ValueError(f"Direction tensor must be 1D or 2D, got {direction.dim()}D")
+        
+        
+        with torch.no_grad():
+            # Compute directional gradient mean: μ_∇f^T v
+            directional_mean = torch.sum(mu_grad * direction, dim=-1)
+            
+            # Compute directional gradient variance: v^T Σ_∇f v
+            # For batch computation: bmm(v.unsqueeze(1), bmm(Sigma_grad, v.unsqueeze(2))).squeeze()
+            direction_expanded = direction.unsqueeze(-1)  # (n, d, 1)
+            temp = torch.bmm(Sigma_grad, direction_expanded).squeeze(-1)  # (n, d)
+            directional_variance = torch.sum(direction * temp, dim=-1)  # (n,)
+            
+            # Clamp variance to prevent numerical issues
+            directional_variance = torch.clamp_min(directional_variance, 1e-9)
+            directional_std = torch.sqrt(directional_variance)
+            
+            # Compute CDF argument: -μ_∇f^T v / √(v^T Σ_∇f v)
+            # Negative because we want P(∇f^T v < 0) for descent probability
+            cdf_arg = -directional_mean / directional_std
+            
+            # Compute probability using standard normal CDF
+            probability = Normal(0, 1).cdf(cdf_arg)
+        
+        return probability
