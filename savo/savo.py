@@ -9,7 +9,12 @@ from typing import List, Union, Optional, Callable, Tuple, Dict
 from copy import deepcopy as copy
 import numpy as np
 import torch
+from botorch.acquisition import UpperConfidenceBound, ExpectedImprovement
+from botorch.optim import optimize_acqf
+from botorch.utils.transforms import normalize, unnormalize
 import sys
+
+
 
 
 import os
@@ -20,7 +25,7 @@ from datetime import datetime
 # from machineIO.utils import df_mean_var, df_mean
 
 from .model import GaussianProcess
-from .util import df_mean_var
+from .util import df_mean_var, get_primes
 
 
 class savo:
@@ -45,6 +50,7 @@ class savo:
                  n_grad_ave: Optional[int] = None,
                  lr: Optional[float] = None,
                  lrES: Optional[float] = None,
+                 gain_scale_ES: Optional[float] = 1.0,
                  optimizer: Optional[Callable] = None,
                  prev_history: Optional[Dict] = None,
                  
@@ -95,7 +101,7 @@ class savo:
         self.model_train_budget = model_train_budget or 200
         self.n_grad_ave = n_grad_ave or 4
         self.lr = lr or 1e-2
-        self.lrES = lrES or 1.0
+        self.lrES = lrES or 1e-2
         self.optimizer = optimizer
 
         self.minimize = minimize
@@ -118,11 +124,29 @@ class savo:
                 self.kES = self.history['ES']['kES'][-1]
                 self.aES = self.history['ES']['aES'][-1]
         else:
-            self.aES = self.control_maxstep  
             # ES dithering freq = 2pi*nu/10,  nu in [0.5,1], factor 10 for at least 10 iteration for smoothing (with dt=1).
-            self.wES = 2*np.pi * (0.5*(np.arange(self.ndim) +0.5) / self.ndim + 0.5)/ 10
-            # ES gain, assuming change of objective in each iter is Delta(obj) ~ O(0.02) and kES*Delta(obj) ~ 0.1*wES*dt, so that phase change from gain is about 10% of dithering phase change.
-            self.kES = 0.1*self.wES/0.02
+            # self.wES = 2*np.pi * (0.5*(np.arange(self.ndim) +0.5) / self.ndim + 0.5)/ 10
+            sqrt_primes = np.sqrt(get_primes(self.ndim))#[::-1]
+            np.random.shuffle(sqrt_primes)
+            max_freq = np.max(sqrt_primes)
+            self.wES = 2 * np.pi * sqrt_primes / (10*max_freq)
+            
+            # self.aES = self.control_maxstep  # for dx = aES*Cos(...)
+            # for dx = (aES*wES)**0.5*Cos(...)  -> stepsize = (aES*wES)**0.5*cos(...) -> stepsize**2 = (aES*wES)*(1/2)
+            self.aES = (2*self.control_maxstep)**2/np.mean(self.wES)
+
+            # for dx = aES*Cos(...)
+            # ES gain, assuming change of objective in each iter is Delta(obj) ~ O(sum((alpha_i*w_i)**2))
+            # and kES*Delta(obj) ~ wES*(dt=1), so that phase change from gain is about same order
+            # of dithering phase change.
+            # self.kES = gain_scale_ES*3*self.wES/(np.sum((self.aES*self.wES)**2))
+
+            # for dx = (aES*wES)**0.5*Cos(...)
+            # we need, kES << 1/(aES*wES)
+            # self.kES = gain_scale_ES*self.wES/np.sqrt(np.sum((self.aES*self.wES)**2))
+            self.kES = 2*self.lrES/self.aES
+
+
             self.history = {
                 'cpu_time':[],
                 'x': [],
@@ -131,6 +155,9 @@ class savo:
                 'yvar': [],
                 'multi_y':[],
                 'multi_yvar':[],
+                'dydx':[],
+                'probability':[],
+                'cov_trace':[],
                 'model_fitloss_histroy':[],
 				'model_fit_time':[],
                 'ES': {'t':[0],
@@ -144,7 +171,12 @@ class savo:
         #set current ctr set and do not wait to read
         self.future = self.evaluator.submit(self.x)
         self.process_evaluator_future()
-
+        self.TurBO_failure_counter = 0
+        self.TurBO_success_counter = 0  
+        self.TurBO_failure_tolerance = 3
+        self.TurBO_success_tolerance = 3
+        self.TurBO_length = self.control_maxstep.copy()
+        
 
     def process_evaluator_future(self):
         now = datetime.now()
@@ -176,6 +208,7 @@ class savo:
                 model_train_budget: Optional[int] = None,
         ):
         n_train_data = n_train_data or self.n_train_data
+        n_train_data = min(n_train_data, 400)
         model_train_budget = model_train_budget or self.model_train_budget
         if train_x is None:
             if self.use_ctrRD_to_train:
@@ -206,36 +239,41 @@ class savo:
         self.history['model_fit_time'].append(self.model.loss_history.runtime)
 
 
-    def _adaptive_kES(self, update_rate=0.01, grad=None):
-        if len(self.history['y']) < 16:
-            self.history['ES']['kES'].append(None)
-            return
-        grad = grad or self.obj_func_grad
+    # def _adaptive_kES(self, update_rate=0.01, grad=None):
+    #     if len(self.history['y']) < 16:
+    #         self.history['ES']['kES'].append(None)
+    #         return
+    #     grad = grad or self.obj_func_grad
 
-        if grad:
-            kES_step = 1.41421 / np.abs(self.aES * grad(self.x))  - self.kES
-        else:
-            y = self.history['y'][-16:]
-            std = np.std(y)
-            variation = std
-            kES_step = 0.1 * self.wES/(variation + 1e-15)  - self.kES
-        # slow update on ES gain
-        self.kES += np.clip(kES_step,
-                            a_min=-update_rate * self.kES,
-                            a_max= update_rate * self.kES)
+    #     if grad:
+    #         kES_step = 1.41421 / np.abs(self.aES * grad(self.x))  - self.kES
+    #     else:
+    #         y = self.history['y'][-16:]
+    #         std = np.std(y)
+    #         variation = std
+    #         kES_step = 0.1 * self.wES/(variation + 1e-15)  - self.kES
+    #     # slow update on ES gain
+    #     self.kES += np.clip(kES_step,
+    #                         a_min=-update_rate * self.kES,
+    #                         a_max= update_rate * self.kES)
         
-        self.history['ES']['t'].append(copy(self.t))
-        self.history['ES']['aES'].append(copy(self.aES))
-        self.history['ES']['kES'].append(copy(self.kES))
+    #     self.history['ES']['t'].append(copy(self.t))
+    #     self.history['ES']['aES'].append(copy(self.aES))
+    #     self.history['ES']['kES'].append(copy(self.kES))
 
 
     def _get_ES_setp(self):
         self.t += 1
         if self.minimize:
-            return self.aES * np.sin(self.t * self.wES + self.kES * self.y)
+            # return self.aES * np.sin(self.t * self.wES + self.kES * self.y)
+            return (self.aES*self.wES)**0.5 * np.sin(self.t * self.wES + self.kES * self.y)
+            # return self.dtES*(self.aES*self.wES)**0.5*np.cos(self.dtES*self.t*self.wES + self.kES*self.y)
         else:
-            return self.aES * np.sin(self.t * self.wES - self.kES * self.y)
+            return (self.aES*self.wES)**0.5 * np.sin(self.t * self.wES - self.kES * self.y)
+            # return self.dtES*(self.aES*self.wES)**0.5*np.cos(self.dtES*self.t*self.wES - self.kES*self.y)
         
+
+
 
     def _get_dydx(self, n_grad_ave, penalize_uncertain_gradient):
         # neighboring points (staggered points toward historical trajectory) for averaged gradient.
@@ -245,10 +283,14 @@ class savo:
         if penalize_uncertain_gradient:
             dydx, probability = self.model.get_maximum_probable_gradient(torch.from_numpy(x_))
             mask = probability < 0.65
+            self.history['probability'].append(probability.mean().item()    )
             probability[mask] = 0.0
             dydx = dydx * probability.view(-1,1)
         else:
             dydx = self.model.get_grad(torch.from_numpy(x_))
+        cov_trace = self.model.get_gradient_covariance_trace(torch.from_numpy(x_))
+        self.history['cov_trace'].append(cov_trace.mean().item())
+        self.history['dydx'].append(dydx.mean(axis=0))
         return dydx
 
 
@@ -270,33 +312,134 @@ class savo:
             return -SG_step
         else:
             return  SG_step
+        
 
+    def TurBO_step(self):
+        """
+        Trust Region Bayesian Optimization (TurBO) step.
+        Uses a single trust region box around the current best point.
+        """
+        # Train the model first
+        self.train_model()
+        
+        # Get current best point and value
+        if len(self.history['y']) == 0:
+            current_best_x = self.x.copy()
+            current_best_y = self.y
+        else:
+            if self.minimize:
+                best_idx = np.argmin(self.history['y'])
+                current_best_y = self.history['y'][best_idx]
+            else:
+                best_idx = np.argmax(self.history['y'])
+                current_best_y = self.history['y'][best_idx]
+            
+            if self.use_ctrRD_to_train:
+                current_best_x = np.array(self.history['xrd'][best_idx])
+            else:
+                current_best_x = np.array(self.history['x'][best_idx])
+        
+        # Define trust region bounds around current best point
+        tr_lb = np.maximum(current_best_x - self.TurBO_length, self.control_min)
+        tr_ub = np.minimum(current_best_x + self.TurBO_length, self.control_max)
+        
+        # Convert to torch tensors
+        tr_bounds = torch.tensor(np.column_stack([tr_lb, tr_ub]).T, dtype=torch.float64)
+        
+        # Set up acquisition function (Upper Confidence Bound)
+        # beta = 2.0  # Exploration parameter
+        best_f = torch.tensor(current_best_y, dtype=torch.float64)
+        if self.minimize:
+            # For minimization, we want to maximize the negative of the function
+            acq_func = ExpectedImprovement(self.model.model, best_f=best_f, maximize=False)
+            # acq_func = ExpectedImprovement(self.model.model, beta=beta, maximize=False)
+        else:
+            acq_func = ExpectedImprovement(self.model.model, best_f=best_f, maximize=True)
+            # acq_func = ExpectedImprovement(self.model.model, beta=beta, maximize=True)
+        
+        # Optimize acquisition function within trust region
+        try:
+            candidate, acq_value = optimize_acqf(
+                acq_function=acq_func,
+                bounds=tr_bounds,
+                q=1,
+                num_restarts=10,
+                raw_samples=100,
+            )
+            
+            # Convert back to numpy and update position
+            next_x = candidate.detach().numpy().flatten()
+            
+            # Evaluate the candidate point
+            self.x = next_x
+            self.future = self.evaluator.submit(self.x)
+            self.process_evaluator_future()
+            
+            # Update trust region based on success/failure
+            improvement_threshold = 1e-3 * np.abs(current_best_y) if current_best_y != 0 else 1e-3
+            
+            if self.minimize:
+                improved = (self.y < current_best_y - improvement_threshold)
+            else:
+                improved = (self.y > current_best_y + improvement_threshold)
+            
+            if improved:
+                # Success: expand trust region
+                self.TurBO_success_counter += 1
+                self.TurBO_failure_counter = 0
+                
+                if self.TurBO_success_counter >= self.TurBO_success_tolerance:
+                    self.TurBO_length = 2.0 * self.TurBO_length
+                    self.TurBO_success_counter = 0
+            else:
+                # Failure: shrink trust region
+                self.TurBO_failure_counter += 1
+                self.TurBO_success_counter = 0
+                
+                if self.TurBO_failure_counter >= self.TurBO_failure_tolerance:
+                    self.TurBO_length = 0.5 * self.TurBO_length
+                    self.TurBO_failure_counter = 0
+                    
+        except Exception as e:
+            print(f"TurBO optimization failed: {e}")
+            # Fallback: random point within trust region
+            self.x = tr_lb + np.random.rand(len(tr_lb)) * (tr_ub - tr_lb)
+            self.future = self.evaluator.submit(self.x)
+            self.process_evaluator_future()
+        
 
     def step(self,
              lr: Optional[float] = None,
-             lrES: Optional[float] = None,
+             lrES_scaler: Optional[float] = None,
              optimizer: Optional[Callable] = None,
              penalize_uncertain_gradient: bool = False,
              normalize_gradient_step: bool = False,
-             lr_adapt2obj_params: Optional[List[float]] = [1,0],
+             lr_adapt2obj_params: Optional[List[float]] = [10,0.8],
              asynchronous: Optional[bool] = None,
+             TurBO: Optional[bool] = False,
             ):
+        if TurBO:
+            self.TurBO_step()
+            return
         
         if lr is None:
             lr = self.lr
-        if lrES is None:
-            lrES = self.lrES
+        if lrES_scaler is None:
+            lrES_scaler = 1.0
             
         if lr_adapt2obj_params is not None:
-            lrES = lrES/(1+np.exp(lr_adapt2obj_params[0]*(self.y- lr_adapt2obj_params[1])))
-            lr = lr    /(1+np.exp(lr_adapt2obj_params[0]*(self.y- lr_adapt2obj_params[1])))
+
+            reduction = 1/(1+np.exp(lr_adapt2obj_params[0]*(self.y- lr_adapt2obj_params[1])))
+
+            lrES_scaler = lrES_scaler*reduction**2
+            lr = lr*reduction
 
         if asynchronous is None:
             asynchronous = self.asynchronous
                 
         if self.future is None:
             dxES = self._get_ES_setp()
-            self.x += dxES*lrES
+            self.x += dxES*lrES_scaler
             self.future = self.evaluator.submit(self.x)
 
         if not asynchronous:
@@ -320,7 +463,7 @@ class savo:
         if asynchronous:
             self.process_evaluator_future()
 
-        self.x += dxSG*lr + dxES*lrES
+        self.x += dxSG*lr + dxES*lrES_scaler
         self.x = np.clip(self.x, a_min=self.control_min, a_max=self.control_max)
         self.future = self.evaluator.submit(self.x)
 
